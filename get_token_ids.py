@@ -23,10 +23,13 @@ def phrase_to_ids(phrase: str, model_name: str = "Qwen/Qwen3-8B"):
 
 if __name__ == "__main__":
     # Example phrases
-    model_name = "nvidia/NVIDIA-Nemotron-Nano-9B-v2" # you can replace with other models from HF Qwen/Qwen3-8B for example...
+    model_name = "nvidia/NVIDIA-Nemotron-Nano-12B-v2" # you can replace with other models from HF Qwen/Qwen3-8B for example...
     print(model_name)
     phrase_to_ids(" Reached thinking limit. </think>", model_name)
     phrase_to_ids(" </think>", model_name)
+    phrase_to_ids("\n</think>\n", model_name)
+    phrase_to_ids("</think>", model_name)
+    phrase_to_ids("see how they fit together.\n</think>\n\n", model_name)
     phrase_to_ids("What is 2 * 4?", model_name)
     phrase_to_ids("<my_spl_token> Reached <SPECIAL_100> thinking limit. </think>", model_name)
     phrase_to_ids("\n<SPECIAL_11>Assistant\n<think>\n", model_name)

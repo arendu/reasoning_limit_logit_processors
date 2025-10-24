@@ -5,6 +5,7 @@ from typing import Optional, Dict, Any, List
 
 import torch
 import json
+import os
 
 from transformers import AutoTokenizer
 from vllm import LLM, SamplingParams
@@ -65,8 +66,19 @@ class DummyLogitsProcessor(LogitsProcessor):
 
 
 class ThinkingBudgetLogitsProcessor(LogitsProcessor):
-    def __init__(self, vllm_config: VllmConfig, device: torch.device, is_pin_memory: bool):
+    def __init__(self, 
+            vllm_config: VllmConfig, 
+            device: torch.device, 
+            is_pin_memory: bool):
+        cfg_env = json.loads(os.getenv("THINKING_BUDGET_LOGITS_PROCESSOR_ARGS", "{}"))
+
         # Store a mapping from request index to output_tok_ids reference
+        print("cfg_env in init:", cfg_env)
+        self.thinking_budget = cfg_env.get("thinking_budget", -1)
+        self.thinking_budget_grace_period = cfg_env.get("thinking_budget_grace_period", -1)
+        self.end_token_ids  = cfg_env.get("end_token_ids", [])
+        self.prompt_think_ids = cfg_env.get("prompt_think_ids", [])
+        self.end_think_ids = cfg_env.get("end_think_ids", [])
         self.logit_processor_state: dict[int, dict[Any, Any]] = {}
 
     def is_argmax_invariant(self) -> bool:
@@ -77,15 +89,25 @@ class ThinkingBudgetLogitsProcessor(LogitsProcessor):
             return
         # Add new requests
         for index, sampling_params, prompt_tok_ids, output_tok_ids in batch_update.added:
-            print("here is the sampling params!!!", sampling_params)
             state = self.logit_processor_state.get(index, {})
             state["output_tok_ids"] = output_tok_ids
-            state["thinking_budget"] = sampling_params.extra_args["thinking_budget"]
-            state["thinking_budget_grace_period"] = sampling_params.extra_args["thinking_budget_grace_period"]
-            state["end_token_ids"] = json.loads(sampling_params.extra_args["end_token_ids"])
+            state["thinking_budget"] = self.thinking_budget
+            state["thinking_budget_grace_period"] = self.thinking_budget_grace_period
+            state["end_token_ids"] = self.end_token_ids
             state["is_thinking"] = False
+            
+            if sampling_params.extra_args:
+                """
+                sampling params can overwrite ones from the cfg_env
+                """
+                state["thinking_budget"] = sampling_params.extra_args["thinking_budget"]
+                state["thinking_budget_grace_period"] = sampling_params.extra_args["thinking_budget_grace_period"]
+                state["end_token_ids"] = json.loads(sampling_params.extra_args["end_token_ids"])
+
             print(f" end of prompt tokens are {prompt_tok_ids[-3:]}")
-            if prompt_tok_ids[-3:] == [49250, 2077, 1561]:  # check for \n<think>\n at the end of the prompt which indicates that the model is in thinking mode.
+            print("here is the sampling params!!!", sampling_params)
+            print("state", state)
+            if prompt_tok_ids[-3:] == self.prompt_think_ids:  # check for \n<think>\n at the end of the prompt which indicates that the model is in thinking mode.
                 state["is_thinking"] = True
                 state["start_of_end"] = False
                 state["end_of_end"] = False
@@ -113,6 +135,14 @@ class ThinkingBudgetLogitsProcessor(LogitsProcessor):
         if state["end_of_end"]:
             return logits
         
+        for eti in self.end_think_ids:
+            check_if_think_ended_naturally = list(state["output_tok_ids"][-len(eti):])
+            if check_if_think_ended_naturally == eti:
+                # if thinking ends normally don't intervene...
+                state["start_of_end"] = True
+                state["end_of_end"] = True
+
+
         if len(state["output_tok_ids"]) >= state["thinking_budget"] + state["thinking_budget_grace_period"] and not state["start_of_end"]:
             state["start_of_end"] = True
 
