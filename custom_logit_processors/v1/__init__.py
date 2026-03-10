@@ -1,2 +1,2 @@
 # custom_logit_processors/v1/__init__.py
-from .nano_v2_logit_processors import ThinkingBudgetLogitsProcessor
+from .nemotron_logit_processors import ThinkingBudgetLogitsProcessor

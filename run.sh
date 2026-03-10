@@ -7,8 +7,8 @@ CONTAINER_IMAGE="/lustre/fs2/portfolios/llmservice/users/lvega/sqsh/vllm-openai-
 CONTAINER_IMAGE="/lustre/fs2/portfolios/llmservice/users/lvega/sqsh/vllm-logits-processor-09-09-25.sqsh"
 CONTAINER_IMAGE="/lustre/fsw/portfolios/llmservice/users/adithyare/containers/vllm_budget_091825.sqsh"
 CONTAINER_IMAGE="/lustre/fsw/portfolios/llmservice/users/dmosallanezh/containers/vllm-nvidia-nano-next-09-17-25.sqsh"
-#CONTAINER_IMAGE="/lustre/fs2/portfolios/llmservice/users/lvega/sqsh/vllm-08-18-25-bf75632.sqsh"
-#CONTAINER_IMAGE="/lustre/fsw/portfolios/coreai/users/terryk/enroot-images/gitlab-master.nvidia.com/terryk/images/nemo-rl:tk-geshen-nm5-58e7ef0-dirty.squashfs"
+CONTAINER_IMAGE="/lustre/fsw/portfolios/llmservice/users/adithyare/container_sqsh_files/nemotron5-111524_mamba_ssm_222_fix.sqsh"
+CONTAINER_IMAGE="/lustre/fsw/portfolios/llmservice/users/adithyare/code/budget_vs_milestones/openmathreasoning/nemo-rl-nano-v3-rc6-prebuilt.squashfs"
 
 srun -A ${ACCOUNT} \
 	-p interactive \
