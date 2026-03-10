@@ -26,7 +26,7 @@ def _build_newline_tokens(tokenizer) -> set:
     for token_id in range(tokenizer.vocab_size):
         try:
             decoded = tokenizer.decode([token_id])
-            if decoded.endswith("\n"):
+            if decoded.endswith("\n\n"):
                 newline_tokens.add(token_id)
         except Exception:
             continue
@@ -43,7 +43,7 @@ class ThinkingBudgetLogitsProcessor(LogitsProcessor):
         cfg_env = json.loads(os.getenv("THINKING_BUDGET_LOGITS_PROCESSOR_ARGS", "{}"))
 
         print("cfg_env in init:", cfg_env)
-        self.tokenizer = AutoTokenizer.from_pretrained(cfg_env.get("model", "nvidia/Nemotron-Nano-3-30B-A3.5B-dev-1024"))
+        self.tokenizer = AutoTokenizer.from_pretrained(cfg_env.get("model", "Qwen/Qwen3-8B"))
         self.thinking_budget = cfg_env.get("thinking_budget", -1)
         self.thinking_budget_grace_period = cfg_env.get("thinking_budget_grace_period", -1)
 
@@ -79,6 +79,7 @@ class ThinkingBudgetLogitsProcessor(LogitsProcessor):
             return
         # Add new requests
         for index, sampling_params, prompt_tok_ids, output_tok_ids in batch_update.added:
+            print(sampling_params.extra_args, "sampling_params.extra_args")
             state = self.logit_processor_state.get(index, {})
             state["output_tok_ids"] = output_tok_ids
             state["thinking_budget"] = self.thinking_budget
@@ -97,9 +98,11 @@ class ThinkingBudgetLogitsProcessor(LogitsProcessor):
                 else:
                     state["end_token_ids"] = self.end_token_ids
 
-            if prompt_tok_ids[-len(self.prompt_think_ids):] == self.prompt_think_ids:  # check for \n<think>\n at the end of the prompt which indicates that the model is in thinking mode.
-                print("model starting thinking via prompt setup...")
+            state["_injecting_milestone"] = False
+            if prompt_tok_ids[-len(self.prompt_think_ids):] == self.prompt_think_ids:
+                print("model starting thinking via prompt_think_ids match...")
                 state["is_thinking"] = True
+                state["available_milestones"] = [10, 20, 30, 40, 50, 60, 70, 80, 90]
                 state["start_of_end"] = False
                 state["end_of_end"] = False
             self.logit_processor_state[index] = state
@@ -121,13 +124,53 @@ class ThinkingBudgetLogitsProcessor(LogitsProcessor):
             if a[-k:] == b[:k]:
                 return k
         return 0
-    
+
+    def _get_milestone_token_ids(self, pct: int) -> list:
+        """Tokenize a milestone marker like '[42% reasoning completed]'."""
+        marker = f"[~{pct}% tokens consumed]"
+        print(f"[ThinkingBudget] _get_milestone_token_ids: marker={marker}")
+        return self.tokenizer(marker, add_special_tokens=False)["input_ids"]
+
+    def _maybe_inject_milestone(self, idx: int, logits: torch.Tensor, state: Dict[Any, Any]):
+        if state.get("end_of_end") or state.get("start_of_end"):
+            return logits
+
+        # Continue injecting milestone tokens if mid-injection
+        if state.get("_injecting_milestone", False):
+            if len(state["_milestone_ids"]):
+                milestone_tok_id = state["_milestone_ids"].pop(0)
+                logits[idx, :] = float("-inf")
+                logits[idx, milestone_tok_id] = 1.0
+                print(f"[ThinkingBudget] continue injecting milestone tokens remaining milestone_tokens={len(state['_milestone_ids'])}")
+            else:
+                print(f"[ThinkingBudget] milestone injection completed... setting _injecting_milestone to False")
+                state["_injecting_milestone"] = False
+            return logits
+
+
+        # Check for newline while still under budget
+        if not state.get("_injecting_milestone", False) and len(state["output_tok_ids"]) > 0 and state["output_tok_ids"][-1] in self.newline_tokens:
+            budget = state["thinking_budget"]
+            tokens_so_far = len(state["output_tok_ids"])
+            pct = min(int(tokens_so_far / budget * 100), 100)
+            pct_milestone = 10 * (pct // 10)
+            print(f"[ThinkingBudget] idx={idx} tokens_so_far={tokens_so_far} budget={budget} pct={pct} pct_milestone={pct_milestone} available_milestones={state.get('available_milestones', [])}")
+            if pct_milestone in state.get("available_milestones", []):
+                state["available_milestones"].remove(pct_milestone)
+                state["_milestone_ids"] = self._get_milestone_token_ids(pct_milestone)
+                state["_injecting_milestone"] = True
+                logits[idx, :] = float("-inf")
+                milestone_tok_id = state["_milestone_ids"].pop(0)
+                logits[idx, milestone_tok_id] = 1.0
+                print(f"[ThinkingBudget] injected milestone {pct_milestone} remaining milestone_tokens={len(state['_milestone_ids'])}")
+            else:
+                print(f"[ThinkingBudget] not injecting milestone {pct_milestone} because it is already injected or not in the available milestones tokens_so_far={tokens_so_far} budget={budget} pct={pct} pct_milestone={pct_milestone} available_milestones={state.get('available_milestones', [])}")
+
+        return logits
+
     def _maybe_end_thinking(self, idx: int, logits: torch.Tensor, state: Dict[Any, Any]):
         if state["end_of_end"]:
             return logits
-
-        if len(state["output_tok_ids"]) > 0 and state["output_tok_ids"][-1] in self.newline_tokens:
-            print(f"[ThinkingBudget] idx={idx} tokens_so_far={len(state['output_tok_ids'])} max_reasoning_tokens={state['thinking_budget']}")
 
         for eti in self.end_think_ids:
             check_if_think_ended_naturally = list(state["output_tok_ids"][-len(eti):])
@@ -137,10 +180,11 @@ class ThinkingBudgetLogitsProcessor(LogitsProcessor):
                 state["end_of_end"] = True
 
 
-        if len(state["output_tok_ids"]) >= state["thinking_budget"] + state["thinking_budget_grace_period"] and not state["start_of_end"]:
+        real_tokens = len(state["output_tok_ids"])
+        if real_tokens >= state["thinking_budget"] + state["thinking_budget_grace_period"] and not state["start_of_end"]:
             state["start_of_end"] = True
 
-        if len(state["output_tok_ids"]) >= state["thinking_budget"] and state["output_tok_ids"][-1] in self.newline_tokens and not state["start_of_end"]:
+        if real_tokens >= state["thinking_budget"] and state["output_tok_ids"][-1] in self.newline_tokens and not state["start_of_end"]:
             state["start_of_end"] = True
         
         if state["start_of_end"] and not state["end_of_end"]:
@@ -161,9 +205,12 @@ class ThinkingBudgetLogitsProcessor(LogitsProcessor):
                 last_n_inputs = list(state["output_tok_ids"][-len(self.prompt_think_ids):])
                 if last_n_inputs == self.prompt_think_ids:
                     state["is_thinking"] = True
+                    state["available_milestones"] = [10, 20, 30, 40, 50, 60, 70, 80, 90]
                     state["start_of_end"] = False
                     state["end_of_end"] = False
                     print("model starting thinking via output tokens...")
+            if state.get("is_thinking", False):
+                logits = self._maybe_inject_milestone(idx, logits, state)
             if state.get("is_thinking", False):
                 logits = self._maybe_end_thinking(idx, logits, state)
         return logits
@@ -178,8 +225,8 @@ def main():
     prompts = [tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True, add_special_tokens=False),
             tokenizer.apply_chat_template(messages2, tokenize=False, add_generation_prompt=True, add_special_tokens=False)]
 
-    sampling_params_list = [SamplingParams(temperature=0.6, max_tokens=1220, extra_args={"thinking_budget": 150, "thinking_budget_grace_period": 30, "end_token_ids": " Reached thinking limit. </think>"}),
-                            SamplingParams(temperature=0.6, max_tokens=1260, extra_args={"thinking_budget": 120, "thinking_budget_grace_period": 20, "end_token_ids": "</think>"})]
+    sampling_params_list = [SamplingParams(temperature=0.6, max_tokens=1220, extra_args={"thinking_budget": 150, "thinking_budget_grace_period": 30, "end_token_ids": " Reached thinking limit. </think>", "model": "Qwen/Qwen3-8B"}),
+                            SamplingParams(temperature=0.6, max_tokens=1260, extra_args={"thinking_budget": 120, "thinking_budget_grace_period": 20, "end_token_ids": " </think>", "model": "Qwen/Qwen3-8B"})]
 
     llm = LLM(
             model=model,
