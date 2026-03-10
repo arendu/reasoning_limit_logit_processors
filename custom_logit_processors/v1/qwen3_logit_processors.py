@@ -6,6 +6,7 @@ from typing import Optional, Dict, Any, List
 import torch
 import json
 import os
+import copy
 
 from transformers import AutoTokenizer
 from vllm import LLM, SamplingParams
@@ -46,7 +47,8 @@ class ThinkingBudgetLogitsProcessor(LogitsProcessor):
         self.tokenizer = AutoTokenizer.from_pretrained(cfg_env.get("model", "Qwen/Qwen3-8B"))
         self.thinking_budget = cfg_env.get("thinking_budget", -1)
         self.thinking_budget_grace_period = cfg_env.get("thinking_budget_grace_period", -1)
-
+        self.enable_milestones = cfg_env.get("enable_milestones", False)
+        self.milestone_frequency = cfg_env.get("milestone_frequency", 10)
         end_token_ids_raw = cfg_env.get("end_token_ids", [])
         prompt_think_ids_raw = cfg_env.get("prompt_think_ids", [])
         end_think_ids_raw = cfg_env.get("end_think_ids", [])
@@ -60,7 +62,10 @@ class ThinkingBudgetLogitsProcessor(LogitsProcessor):
         print(f"Resolved end_token_ids: {self.end_token_ids}")
         print(f"Resolved prompt_think_ids: {self.prompt_think_ids}")
         print(f"Resolved end_think_ids: {self.end_think_ids}")
-
+        print(f"enable_milestones: {self.enable_milestones}")
+        self.available_milestones = {i : self._get_milestone_token_ids(i) for i in list(range(self.milestone_frequency, 101-self.milestone_frequency, self.milestone_frequency))} if self.enable_milestones else {}
+        for k, v in self.available_milestones.items():
+            print(f"initializing available_milestones[{k}]: {v}")
         self.logit_processor_state: dict[int, dict[Any, Any]] = {}
 
     def _to_ids(self, value) -> list:
@@ -102,7 +107,7 @@ class ThinkingBudgetLogitsProcessor(LogitsProcessor):
             if prompt_tok_ids[-len(self.prompt_think_ids):] == self.prompt_think_ids:
                 print("model starting thinking via prompt_think_ids match...")
                 state["is_thinking"] = True
-                state["available_milestones"] = [10, 20, 30, 40, 50, 60, 70, 80, 90]
+                state["available_milestones"] = copy.deepcopy(self.available_milestones)
                 state["start_of_end"] = False
                 state["end_of_end"] = False
             self.logit_processor_state[index] = state
@@ -154,10 +159,10 @@ class ThinkingBudgetLogitsProcessor(LogitsProcessor):
             tokens_so_far = len(state["output_tok_ids"])
             pct = min(int(tokens_so_far / budget * 100), 100)
             pct_milestone = 10 * (pct // 10)
-            print(f"[ThinkingBudget] idx={idx} tokens_so_far={tokens_so_far} budget={budget} pct={pct} pct_milestone={pct_milestone} available_milestones={state.get('available_milestones', [])}")
-            if pct_milestone in state.get("available_milestones", []):
-                state["available_milestones"].remove(pct_milestone)
-                state["_milestone_ids"] = self._get_milestone_token_ids(pct_milestone)
+            print(f"[ThinkingBudget] idx={idx} tokens_so_far={tokens_so_far} budget={budget} pct={pct} pct_milestone={pct_milestone} available_milestones={state.get('available_milestones', {})}")
+            if pct_milestone in state["available_milestones"]:
+                milestone_tok_ids = state["available_milestones"].pop(pct_milestone)
+                state["_milestone_ids"] = milestone_tok_ids 
                 state["_injecting_milestone"] = True
                 logits[idx, :] = float("-inf")
                 milestone_tok_id = state["_milestone_ids"].pop(0)
@@ -205,7 +210,7 @@ class ThinkingBudgetLogitsProcessor(LogitsProcessor):
                 last_n_inputs = list(state["output_tok_ids"][-len(self.prompt_think_ids):])
                 if last_n_inputs == self.prompt_think_ids:
                     state["is_thinking"] = True
-                    state["available_milestones"] = [10, 20, 30, 40, 50, 60, 70, 80, 90]
+                    state["available_milestones"] = copy.deepcopy(self.available_milestones)
                     state["start_of_end"] = False
                     state["end_of_end"] = False
                     print("model starting thinking via output tokens...")
@@ -225,8 +230,8 @@ def main():
     prompts = [tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True, add_special_tokens=False),
             tokenizer.apply_chat_template(messages2, tokenize=False, add_generation_prompt=True, add_special_tokens=False)]
 
-    sampling_params_list = [SamplingParams(temperature=0.6, max_tokens=1220, extra_args={"thinking_budget": 150, "thinking_budget_grace_period": 30, "end_token_ids": " Reached thinking limit. </think>", "model": "Qwen/Qwen3-8B"}),
-                            SamplingParams(temperature=0.6, max_tokens=1260, extra_args={"thinking_budget": 120, "thinking_budget_grace_period": 20, "end_token_ids": " </think>", "model": "Qwen/Qwen3-8B"})]
+    sampling_params_list = [SamplingParams(temperature=0.6, max_tokens=1220, extra_args={"thinking_budget": 1050, "thinking_budget_grace_period": 30, "end_token_ids": " Reached thinking limit. </think>", "model": "Qwen/Qwen3-8B"}),
+                            SamplingParams(temperature=0.6, max_tokens=1260, extra_args={"thinking_budget": 600, "thinking_budget_grace_period": 20, "end_token_ids": " </think>", "model": "Qwen/Qwen3-8B"})]
 
     llm = LLM(
             model=model,
