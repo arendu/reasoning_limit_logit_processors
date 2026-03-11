@@ -230,8 +230,8 @@ def main():
     prompts = [tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True, add_special_tokens=False),
             tokenizer.apply_chat_template(messages2, tokenize=False, add_generation_prompt=True, add_special_tokens=False)]
 
-    sampling_params_list = [SamplingParams(temperature=0.6, max_tokens=1220, extra_args={"thinking_budget": 1050, "thinking_budget_grace_period": 30, "end_token_ids": " Reached thinking limit. </think>", "model": "Qwen/Qwen3-8B"}),
-                            SamplingParams(temperature=0.6, max_tokens=1260, extra_args={"thinking_budget": 600, "thinking_budget_grace_period": 20, "end_token_ids": " </think>", "model": "Qwen/Qwen3-8B"})]
+    sampling_params_list = [SamplingParams(temperature=0.6, max_tokens=1220, extra_args={"thinking_budget": 1050, "thinking_budget_grace_period": 30, "end_token_ids": " Reached thinking limit. </think>"}),
+                            SamplingParams(temperature=0.6, max_tokens=1260, extra_args={"thinking_budget": 600, "thinking_budget_grace_period": 20, "end_token_ids": " </think>"})]
 
     llm = LLM(
             model=model,
