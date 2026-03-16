@@ -71,6 +71,13 @@ class ThinkingBudgetLogitsProcessor(LogitsProcessor):
         self.available_milestones = {i : self._get_milestone_token_ids(i) for i in list(range(self.milestone_frequency, 101-self.milestone_frequency, self.milestone_frequency))} if self.enable_milestones else {}
         for k, v in self.available_milestones.items():
             print(f"initializing available_milestones[{k}]: {v}")
+
+        self.enable_injection_position_metadata = cfg_env.get("enable_injection_position_metadata", False)
+        print(f"enable_injection_position_metadata: {self.enable_injection_position_metadata}")
+
+        self.eod_token_ids = self._build_eod_token_ids(cfg_env) if self.enable_injection_position_metadata else set()
+        print(f"EOD token IDs: {self.eod_token_ids}")
+
         self.logit_processor_state: dict[int, dict[Any, Any]] = {}
 
     def _to_ids(self, value) -> list:
@@ -80,6 +87,54 @@ class ThinkingBudgetLogitsProcessor(LogitsProcessor):
         if isinstance(value, list) and all(isinstance(v, int) for v in value):
             return value
         return value
+
+    def _build_eod_token_ids(self, cfg_env: dict) -> set:
+        """Build the set of end-of-document token IDs to intercept."""
+        eod_ids = set()
+        if cfg_env.get("eod_token_ids"):
+            for tid in self._to_ids(cfg_env["eod_token_ids"]):
+                eod_ids.add(tid)
+        if self.tokenizer.eos_token_id is not None:
+            eod_ids.add(self.tokenizer.eos_token_id)
+        for special_name in ["<|im_end|>", "<|endoftext|>"]:
+            tid = self.tokenizer.convert_tokens_to_ids(special_name)
+            if isinstance(tid, int) and tid != self.tokenizer.unk_token_id:
+                eod_ids.add(tid)
+        return eod_ids
+
+    def _maybe_suppress_eod(self, idx: int, logits: torch.Tensor, state: Dict[Any, Any]) -> torch.Tensor:
+        """Suppress EOD tokens unless EOD is the argmax, in which case inject delay tokens first."""
+        if state["_is_delaying_eod"]:
+            if state["_delay_eod_ids"]:
+                tok = state["_delay_eod_ids"].pop(0)
+                logits[idx, :] = float("-inf")
+                logits[idx, tok] = 1.0
+                state["injected_positions"].append(len(state["output_tok_ids"]))
+                print(f"[ThinkingBudget] delaying EOD, injecting token={tok}, remaining={len(state['_delay_eod_ids'])}")
+            else:
+                eod_id = state["_original_eod_id"]
+                logits[idx, :] = float("-inf")
+                logits[idx, eod_id] = 1.0
+                state["injected_positions"].append(len(state["output_tok_ids"]))
+                state["_is_delaying_eod"] = False
+                print(f"[ThinkingBudget] EOD delay complete, forcing EOD token={eod_id}. output_tokens={len(state.get('output_tok_ids', []))}")
+            return logits
+
+        argmax_id = logits[idx].argmax().item()
+        if argmax_id in self.eod_token_ids:
+            metadata_str = " [Injected tokens:" + json.dumps(state["injected_positions"]) + "]"
+            state["_is_delaying_eod"] = True
+            state["_original_eod_id"] = argmax_id
+            state["_delay_eod_ids"] = self.tokenizer(metadata_str, add_special_tokens=False)["input_ids"]
+            tok = state["_delay_eod_ids"].pop(0)
+            logits[idx, :] = float("-inf")
+            logits[idx, tok] = 1.0
+            state["injected_positions"].append(len(state["output_tok_ids"]))
+            print(f"[ThinkingBudget] EOD is argmax (token={argmax_id}), starting delay injection. metadata={metadata_str!r}")
+        else:
+            for eod_id in self.eod_token_ids:
+                logits[idx, eod_id] = float("-inf")
+        return logits
 
     def is_argmax_invariant(self) -> bool:
         return False  # This processor does not affect sampling
@@ -109,6 +164,9 @@ class ThinkingBudgetLogitsProcessor(LogitsProcessor):
                     state["end_token_ids"] = self.end_token_ids
 
             state["_injecting_milestone"] = False
+            state["_is_delaying_eod"] = False
+            state["_delay_eod_ids"] = []
+            state["injected_positions"] = []
             if prompt_tok_ids[-len(self.prompt_think_ids):] == self.prompt_think_ids:
                 print("model starting thinking via prompt_think_ids match...")
                 state["is_thinking"] = True
@@ -151,6 +209,7 @@ class ThinkingBudgetLogitsProcessor(LogitsProcessor):
                 milestone_tok_id = state["_milestone_ids"].pop(0)
                 logits[idx, :] = float("-inf")
                 logits[idx, milestone_tok_id] = 1.0
+                state["injected_positions"].append(len(state["output_tok_ids"]))
                 print(f"[ThinkingBudget] continue injecting milestone tokens remaining milestone_tokens={len(state['_milestone_ids'])}")
             else:
                 print(f"[ThinkingBudget] milestone injection completed... setting _injecting_milestone to False")
@@ -172,6 +231,7 @@ class ThinkingBudgetLogitsProcessor(LogitsProcessor):
                 logits[idx, :] = float("-inf")
                 milestone_tok_id = state["_milestone_ids"].pop(0)
                 logits[idx, milestone_tok_id] = 1.0
+                state["injected_positions"].append(len(state["output_tok_ids"]))
                 print(f"[ThinkingBudget] injected milestone {pct_milestone} remaining milestone_tokens={len(state['_milestone_ids'])}")
             else:
                 print(f"[ThinkingBudget] not injecting milestone {pct_milestone} because it is already injected or not in the available milestones tokens_so_far={tokens_so_far} budget={budget} pct={pct} pct_milestone={pct_milestone} available_milestones={state.get('available_milestones', [])}")
@@ -205,6 +265,7 @@ class ThinkingBudgetLogitsProcessor(LogitsProcessor):
                 logits[idx, :] = float("-inf") 
                 insert_id = end_token_ids[overlap]
                 logits[idx, insert_id] = 1.0
+                state["injected_positions"].append(len(state["output_tok_ids"]))
             else:
                 state["end_of_end"] = True
         return logits
@@ -223,6 +284,8 @@ class ThinkingBudgetLogitsProcessor(LogitsProcessor):
                 logits = self._maybe_inject_milestone(idx, logits, state)
             if state.get("is_thinking", False):
                 logits = self._maybe_end_thinking(idx, logits, state)
+            if self.enable_injection_position_metadata:
+                logits = self._maybe_suppress_eod(idx, logits, state)
         return logits
 
 def main():
