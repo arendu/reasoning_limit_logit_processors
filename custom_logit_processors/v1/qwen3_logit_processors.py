@@ -41,7 +41,12 @@ class ThinkingBudgetLogitsProcessor(LogitsProcessor):
             vllm_config: VllmConfig, 
             device: torch.device, 
             is_pin_memory: bool):
-        cfg_env = json.loads(os.getenv("THINKING_BUDGET_LOGITS_PROCESSOR_ARGS", "{}"))
+        args_file = os.getenv("THINKING_BUDGET_LOGITS_PROCESSOR_ARGS_FILE")
+        if args_file and os.path.exists(args_file):
+            with open(args_file) as f:
+                cfg_env = json.load(f)
+        else:
+            cfg_env = json.loads(os.getenv("THINKING_BUDGET_LOGITS_PROCESSOR_ARGS", "{}"))
 
         print("cfg_env in init:", cfg_env)
         self.tokenizer = AutoTokenizer.from_pretrained(cfg_env.get("model", "Qwen/Qwen3-8B"))
