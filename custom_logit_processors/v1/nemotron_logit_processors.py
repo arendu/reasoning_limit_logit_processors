@@ -1,174 +1,18 @@
-# copied from here https://docs.vllm.ai/en/v0.10.1.1/examples/offline_inference/logits_processor.html
-
-from types import DynamicClassAttribute
-from typing import Optional, Dict, Any, List
-
-import torch
-import json
-import os
+from .base_logit_processor import ThinkingBudgetLogitsProcessorBase
 
 from transformers import AutoTokenizer
 from vllm import LLM, SamplingParams
-from vllm.config import VllmConfig
-from vllm.v1.sample.logits_processor import (
-    BatchUpdate,
-    LogitsProcessor,
-    MoveDirectionality,
-)
-from vllm.v1.sample.logits_processor.builtin import process_dict_updates
-
-#import os
-#os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
-
-def _build_newline_tokens(tokenizer) -> set:
-    """Scan the full vocab and return the set of token IDs whose decoded text ends with a newline."""
-    newline_tokens = set()
-    for token_id in range(tokenizer.vocab_size):
-        try:
-            decoded = tokenizer.decode([token_id])
-            if decoded.endswith("\n"):
-                newline_tokens.add(token_id)
-        except Exception:
-            continue
-    print(f"Built newline token set: {len(newline_tokens)} tokens")
-    return newline_tokens
 
 
+class ThinkingBudgetLogitsProcessor(ThinkingBudgetLogitsProcessorBase):
+    DEFAULT_MODEL = "nvidia/Nemotron-Nano-3-30B-A3.5B-dev-1024"
+    DEFAULT_PROMPT_THINK_IDS = "<think>\n"
+    DEFAULT_END_THINK_IDS = ["</think>"]
 
-class ThinkingBudgetLogitsProcessor(LogitsProcessor):
-    def __init__(self, 
-            vllm_config: VllmConfig, 
-            device: torch.device, 
-            is_pin_memory: bool):
-        args_file = os.getenv("THINKING_BUDGET_LOGITS_PROCESSOR_ARGS_FILE")
-        if args_file and os.path.exists(args_file):
-            with open(args_file) as f:
-                cfg_env = json.load(f)
-        else:
-            cfg_env = json.loads(os.getenv("THINKING_BUDGET_LOGITS_PROCESSOR_ARGS", "{}"))
-
-        print("cfg_env in init:", cfg_env)
-        self.tokenizer = AutoTokenizer.from_pretrained(cfg_env.get("model", "nvidia/Nemotron-Nano-3-30B-A3.5B-dev-1024"))
-        self.thinking_budget = cfg_env.get("thinking_budget", -1)
-        self.thinking_budget_grace_period = cfg_env.get("thinking_budget_grace_period", -1)
-
-        end_token_ids_raw = cfg_env.get("end_token_ids", [])
-        prompt_think_ids_raw = cfg_env.get("prompt_think_ids", [])
-        end_think_ids_raw = cfg_env.get("end_think_ids", [])
-
-        self.end_token_ids = self._to_ids(end_token_ids_raw)
-        self.prompt_think_ids = self._to_ids(prompt_think_ids_raw)
-        self.end_think_ids = [self._to_ids(e) for e in end_think_ids_raw] if end_think_ids_raw and isinstance(end_think_ids_raw[0], (str, list)) else [self._to_ids(end_think_ids_raw)]
-
-        self.newline_tokens = _build_newline_tokens(self.tokenizer)
-
-        print(f"Resolved end_token_ids: {self.end_token_ids}")
-        print(f"Resolved prompt_think_ids: {self.prompt_think_ids}")
-        print(f"Resolved end_think_ids: {self.end_think_ids}")
-
-        self.logit_processor_state: dict[int, dict[Any, Any]] = {}
-
-    def _to_ids(self, value) -> list:
-        """Convert a string or list of ints to token IDs (see get_token_ids.py)."""
-        if isinstance(value, str):
-            return self.tokenizer(value, add_special_tokens=False)["input_ids"]
-        if isinstance(value, list) and all(isinstance(v, int) for v in value):
-            return value
-        return value
-
-    def is_argmax_invariant(self) -> bool:
-        return False  # This processor does not affect sampling
-
-    def update_state(self, batch_update: Optional[BatchUpdate]):
-        if not batch_update:
-            return
-        # Add new requests
-        for index, sampling_params, prompt_tok_ids, output_tok_ids in batch_update.added:
-            state = self.logit_processor_state.get(index, {})
-            state["output_tok_ids"] = output_tok_ids
-            state["thinking_budget"] = self.thinking_budget
-            state["thinking_budget_grace_period"] = self.thinking_budget_grace_period
-            state["end_token_ids"] = self.end_token_ids
-            state["is_thinking"] = False
-            
-            if sampling_params.extra_args:
-                """
-                sampling params can overwrite ones from the cfg_env
-                """
-                state["thinking_budget"] = sampling_params.extra_args.get("thinking_budget", self.thinking_budget)
-                state["thinking_budget_grace_period"] = sampling_params.extra_args.get("thinking_budget_grace_period", self.thinking_budget_grace_period)
-                if "end_token_ids" in sampling_params.extra_args:
-                    state["end_token_ids"] = self._to_ids(sampling_params.extra_args["end_token_ids"])
-                else:
-                    state["end_token_ids"] = self.end_token_ids
-
-            if prompt_tok_ids[-len(self.prompt_think_ids):] == self.prompt_think_ids:  # check for \n<think>\n at the end of the prompt which indicates that the model is in thinking mode.
-                print("model starting thinking...")
-                state["is_thinking"] = True
-                state["start_of_end"] = False
-                state["end_of_end"] = False
-            self.logit_processor_state[index] = state
-        # Remove finished requests
-        for index in batch_update.removed:
-            self.logit_processor_state.pop(index, None)
-        # Handle moved requests
-        for a, b, direction in batch_update.moved:
-            a_val = self.logit_processor_state.pop(a, None)
-            b_val = self.logit_processor_state.pop(b, None)
-            if a_val is not None:
-                self.logit_processor_state[b] = a_val
-            if direction.name == "SWAP" and b_val is not None:
-                self.logit_processor_state[a] = b_val
-    
-    def _suffix_prefix_overlap(self, a, b):
-        m = min(len(a), len(b))
-        for k in range(m, 0, -1):           # try longest first
-            if a[-k:] == b[:k]:
-                return k
-        return 0
-    
-    def _maybe_end_thinking(self, idx: int, logits: torch.Tensor, state: Dict[Any, Any]):
-        if state["end_of_end"]:
-            return logits
-
-        if len(state["output_tok_ids"]) > 0 and state["output_tok_ids"][-1] in self.newline_tokens:
-            print(f"[ThinkingBudget] idx={idx} tokens_so_far={len(state['output_tok_ids'])} max_reasoning_tokens={state['thinking_budget']}")
-
-        for eti in self.end_think_ids:
-            check_if_think_ended_naturally = list(state["output_tok_ids"][-len(eti):])
-            if check_if_think_ended_naturally == eti:
-                # if thinking ends normally don't intervene...
-                state["start_of_end"] = True
-                state["end_of_end"] = True
-
-
-        if len(state["output_tok_ids"]) >= state["thinking_budget"] + state["thinking_budget_grace_period"] and not state["start_of_end"]:
-            state["start_of_end"] = True
-
-        if len(state["output_tok_ids"]) >= state["thinking_budget"] and state["output_tok_ids"][-1] in self.newline_tokens and not state["start_of_end"]:
-            state["start_of_end"] = True
-        
-        if state["start_of_end"] and not state["end_of_end"]:
-            end_token_ids = state["end_token_ids"]
-            last_n_inputs = list(state["output_tok_ids"][-len(end_token_ids):])
-            overlap = self._suffix_prefix_overlap(last_n_inputs, end_token_ids)
-            if overlap < len(end_token_ids):
-                logits[idx, :] = float("-inf") 
-                insert_id = end_token_ids[overlap]
-                logits[idx, insert_id] = 1.0
-            else:
-                state["end_of_end"] = True
-        return logits
-
-    def apply(self, logits: torch.Tensor) -> torch.Tensor:
-        for idx, state in self.logit_processor_state.items():
-            if state.get("is_thinking", False):
-                logits = self._maybe_end_thinking(idx, logits, state)
-        return logits
 
 def main():
     model = "nvidia/Nemotron-Nano-3-30B-A3.5B-dev-1024"
-    msg = """Bob is an avid fan of the video game \"League of Leesins\", and today he celebrates as the League of Leesins World Championship comes to an end! \n\nThe tournament consisted of $n$ ($n \\ge 5$) teams around the world. Before the tournament starts, Bob has made a prediction of the rankings of each team, from $1$-st to $n$-th. After the final, he compared the prediction with the actual result and found out that the $i$-th team according to his prediction ended up at the $p_i$-th position ($1 \\le p_i \\le n$, all $p_i$ are unique). In other words, $p$ is a permutation of $1, 2, \\dots, n$.\n\nAs Bob's favorite League player is the famous \"3ga\", he decided to write down every $3$ consecutive elements of the permutation $p$. Formally, Bob created an array $q$ of $n-2$ triples, where $q_i = (p_i, p_{i+1}, p_{i+2})$ for each $1 \\le i \\le n-2$. Bob was very proud of his array, so he showed it to his friend Alice.\n\nAfter learning of Bob's array, Alice declared that she could retrieve the permutation $p$ even if Bob rearranges the elements of $q$ and the elements within each triple. Of course, Bob did not believe in such magic, so he did just the same as above to see Alice's respond.\n\nFor example, if $n = 5$ and $p = [1, 4, 2, 3, 5]$, then the original array $q$ will be $[(1, 4, 2), (4, 2, 3), (2, 3, 5)]$. Bob can then rearrange the numbers within each triple and the positions of the triples to get $[(4, 3, 2), (2, 3, 5), (4, 1, 2)]$. Note that $[(1, 4, 2), (4, 2, 2), (3, 3, 5)]$ is not a valid rearrangement of $q$, as Bob is not allowed to swap numbers belong to different triples.\n\nAs Alice's friend, you know for sure that Alice was just trying to show off, so you decided to save her some face by giving her any permutation $p$ that is consistent with the array $q$ she was given. \n\n\n-----Input-----\n\nThe first line contains a single integer $n$ ($5 \\le n \\le 10^5$) — the size of permutation $p$.\n\nThe $i$-th of the next $n-2$ lines contains $3$ integers $q_{i, 1}$, $q_{i, 2}$, $q_{i, 3}$ ($1 \\le q_{i, j} \\le n$) — the elements of the $i$-th triple of the rearranged (shuffled) array $q_i$, in random order. Remember, that the numbers within each triple can be rearranged and also the positions of the triples can be rearranged.\n\nIt is guaranteed that there is at least one permutation $p$ that is consistent with the input. \n\n\n-----Output-----\n\nPrint $n$ distinct integers $p_1, p_2, \\ldots, p_n$ ($1 \\le p_i \\le n$) such that $p$ is consistent with array $q$. \n\nIf there are multiple answers, print any. \n\n\n-----Example-----\nInput\n5\n4 3 2\n2 3 5\n4 1 2\n\nOutput\n1 4 2 3 5\n\n\nRead the inputs from stdin solve the problem and write the answer to stdout (do not directly test on the sample inputs). Enclose your code within delimiters as follows. Ensure that when the python program runs, it reads the inputs, runs the algorithm and writes output to STDOUT.\n```python\n# YOUR CODE HERE\n```"""
+    msg = """Bob is an avid fan of the video game \"League of Leesins\", and today he celebrates as the League of Leesins World Championship comes to an end! \n\nThe tournament consisted of $n$ ($n \\ge 5$) teams around the world. Before the tournament starts, Bob has made a prediction of the rankings of each team, from $1$-st to $n$-th. After the final, he compared the prediction with the actual result and found out that the $i$-th team according to his prediction ended up at the $p_i$-th position ($1 \\le p_i \\le n$, all $p_i$ are unique). In other words, $p$ is a permutation of $1, 2, \\dots, n$.\n\nAs Bob's favorite League player is the famous \"3ga\", he decided to write down every $3$ consecutive elements of the permutation $p$. Formally, Bob created an array $q$ of $n-2$ triples, where $q_i = (p_i, p_{i+1}, p_{i+2})$ for each $1 \\le i \\le n-2$. Bob was very proud of his array, so he showed it to his friend Alice.\n\nAfter learning of Bob's array, Alice declared that she could retrieve the permutation $p$ even if Bob rearranges the elements of $q$ and the elements within each triple. Of course, Bob did not believe in such magic, so he did just the same as above to see Alice's respond.\n\nFor example, if $n = 5$ and $p = [1, 4, 2, 3, 5]$, then the original array $q$ will be $[(1, 4, 2), (4, 2, 3), (2, 3, 5)]$. Bob can then rearrange the numbers within each triple and the positions of the triples to get $[(4, 3, 2), (2, 3, 5), (4, 1, 2)]$. Note that $[(1, 4, 2), (4, 2, 2), (3, 3, 5)]$ is not a valid rearrangement of $q$, as Bob is not allowed to swap numbers belong to different triples.\n\nAs Alice's friend, you know for sure that Alice was just trying to show off, so you decided to save her some face by giving her any permutation $p$ that is consistent with the array $q$ she was given. \n\n\n-----Input-----\n\nThe first line contains a single integer $n$ ($5 \\le n \\le 10^5$) — the size of permutation $p$.\n\nThe $i$-th of the next $n-2$ lines contains $3$ integers $q_{i, 1}$, $q_{i, 2}$, $q_{i, 3}$ ($1 \\le q_{i, j} \\le n$) — the elements of the $i$-th triple of the rearranged (shuffled) array $q_i$, in random order. Remember, that the numbers within each triple can be rearranged and also the positions of the triples can be rearranged.\n\nIt is guaranteed that there is at least one permutation $p$ that is consistent with the input. \n\n\n-----Output-----\n\nPrint $n$ distinct integers $p_1, p_2, \\ldots, p_n$ ($1 \\le p_i \\le n$) such that $p$ is consistent with array $q$. \n\nIf there are multiple answers, print any. \n\n\n-----Example-----\nInput\n5\n4 3 2\n2 3 5\n4 1 2\n\nOutput\n1 4 2 3 5\n\n\nRead the inputs from stdin solve the problem and write the answer to stdout (do not directly test on the sample inputs). Enclose your code within delimiters as follows. Ensure that when the python program runs, it reads the inputs, runs the algorithm and writes output to STDOUT.\n```python\n# YOUR CODE HERE\n```"""
     messages = [{"role": "system", "content": "You are a helpful assistant."},{"role": "user", "content": msg}]
     messages2= [{"role": "system", "content": "You are a helpful assistant."},{"role": "user", "content": "Write a haiku about a cat"}]
     tokenizer = AutoTokenizer.from_pretrained(model)
