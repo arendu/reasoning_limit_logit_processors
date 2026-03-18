@@ -148,15 +148,15 @@ class ThinkingBudgetLogitsProcessorBase(LogitsProcessor):
 
         argmax_id = logits[idx].argmax().item()
         if argmax_id in self.eod_token_ids:
-            metadata_str = " [Injected tokens:" + json.dumps(state["injected_positions"]) + "]"
+            metadata_delim_str = " <|injected_token_positions|>"
             state["_is_delaying_eod"] = True
             state["_original_eod_id"] = argmax_id
-            state["_delay_eod_ids"] = self.tokenizer(metadata_str, add_special_tokens=False)["input_ids"]
+            state["_delay_eod_ids"] = self.tokenizer(metadata_delim_str, add_special_tokens=False)["input_ids"] + self.tokenizer(json.dumps(state["injected_positions"]), add_special_tokens=False)["input_ids"]
             tok = state["_delay_eod_ids"].pop(0)
             logits[idx, :] = float("-inf")
             logits[idx, tok] = 1.0
             state["injected_positions"].append(len(state["output_tok_ids"]))
-            logger.info("EOD is argmax (token=%d), starting delay injection. metadata=%r", argmax_id, metadata_str)
+            logger.info("EOD is argmax (token=%d), starting delay injection. metadata=%r", argmax_id, metadata_delim_str)
         else:
             for eod_id in self.eod_token_ids:
                 logits[idx, eod_id] = float("-inf")

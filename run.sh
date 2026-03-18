@@ -9,6 +9,7 @@ CONTAINER_IMAGE="/lustre/fsw/portfolios/llmservice/users/adithyare/containers/vl
 CONTAINER_IMAGE="/lustre/fsw/portfolios/llmservice/users/dmosallanezh/containers/vllm-nvidia-nano-next-09-17-25.sqsh"
 CONTAINER_IMAGE="/lustre/fsw/portfolios/llmservice/users/adithyare/container_sqsh_files/nemotron5-111524_mamba_ssm_222_fix.sqsh"
 CONTAINER_IMAGE="/lustre/fsw/portfolios/llmservice/users/adithyare/code/budget_vs_milestones/openmathreasoning/nemo-rl-nano-v3-rc6-prebuilt.squashfs"
+CONTAINER_IMAGE="/lustre/fsw/portfolios/llmservice/users/adithyare/code/budget_vs_milestones/openmathreasoning/nemo-rl-nano-v3-rc6-prebuilt-vllm.squashfs"
 
 srun -A ${ACCOUNT} \
 	-p interactive \

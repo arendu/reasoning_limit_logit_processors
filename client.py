@@ -32,7 +32,7 @@ print(full_text)
 print()
 
 import re
-match = re.search(r'\[Injected tokens:(\[.*?\])\]', full_text)
+match = re.search(r'<\|injected_token_positions\|>(\[.*?\])', full_text)
 if match:
     injected_positions = json.loads(match.group(1))
     print(f"Found {len(injected_positions)} injected positions: {injected_positions}")
@@ -43,4 +43,4 @@ if match:
         else:
             print(f"  pos {pos:5d} -> (beyond logprobs range)")
 else:
-    print("No [Injected tokens:...] metadata found in output")
+    print("No <|injected_token_positions|> metadata found in output")
