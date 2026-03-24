@@ -1,8 +1,8 @@
-# Custom Logit Processors
+# Reasoning Limit Logit Processors
 
 vLLM v1 logit processors for thinking-budget control, milestone injection, and injection position metadata.
 
-Supports Qwen3, Nemotron Nano V3, and Nemotron Nano V2.
+Supports Qwen3, Qwen3-4B-Thinking-2507, Nemotron Nano V3, and Nemotron Nano V2.
 
 ## Setup
 
@@ -19,6 +19,9 @@ Each model has a serve script that sets server-level config via `THINKING_BUDGET
 ```bash
 # Qwen3-8B
 bash serve_qwen3.sh
+
+# Qwen3-4B-Thinking-2507
+bash serve_qwen3_thinking2507.sh
 
 # Nemotron Nano V3
 bash serve_v3.sh
@@ -62,6 +65,7 @@ Example:
 | Model | `--logits-processors` value |
 |---|---|
 | Qwen3 | `custom_logit_processors.v1.qwen3_logit_processors:ThinkingBudgetLogitsProcessor` |
+| Qwen3-4B-Thinking-2507 | `custom_logit_processors.v1.qwen3_thinking2507_logit_processors:ThinkingBudgetLogitsProcessor` |
 | Nemotron V3 / V2 | `custom_logit_processors.v1.nemotron_logit_processors:ThinkingBudgetLogitsProcessor` |
 
 ## Client Usage
@@ -121,11 +125,13 @@ if match:
 ## Architecture
 
 ```
-base_logit_processor.py          # ThinkingBudgetLogitsProcessorBase (all shared logic)
-├── qwen3_logit_processors.py    # DEFAULT_MODEL = "Qwen/Qwen3-8B"
-│                                # DEFAULT_PROMPT_THINK_IDS = "<think>"
-└── nemotron_logit_processors.py # DEFAULT_MODEL = "nvidia/Nemotron-Nano-3-30B-A3.5B-dev-1024"
-                                 # DEFAULT_PROMPT_THINK_IDS = "<think>\n"
+base_logit_processor.py                    # ThinkingBudgetLogitsProcessorBase (all shared logic)
+├── qwen3_logit_processors.py              # DEFAULT_MODEL = "Qwen/Qwen3-8B"
+│                                          # DEFAULT_PROMPT_THINK_IDS = "<think>"
+├── qwen3_thinking2507_logit_processors.py # DEFAULT_MODEL = "Qwen/Qwen3-4B-Thinking-2507"
+│                                          # DEFAULT_PROMPT_THINK_IDS = "<think>\n"
+└── nemotron_logit_processors.py           # DEFAULT_MODEL = "nvidia/Nemotron-Nano-3-30B-A3.5B-dev-1024"
+                                           # DEFAULT_PROMPT_THINK_IDS = "<think>\n"
 ```
 
 Subclasses only set class-level defaults. All logic lives in the base class.
